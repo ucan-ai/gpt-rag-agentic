@@ -133,7 +133,7 @@ async def vector_index_retrieve(
             f"metadata_security_id/any(g:search.in(g, '{security_ids}')) "
             f"or not metadata_security_id/any()"
         )
-        body["filter"] = filter_str
+        #body["filter"] = filter_str
         logging.debug(f"[vector_index_retrieve] Search filter: {filter_str}")
 
         headers = {
@@ -284,7 +284,7 @@ async def multimodal_vector_index_retrieve(
         f"metadata_security_id/any(g:search.in(g, '{security_ids}')) "
         "or not metadata_security_id/any()"
     )
-    body["filter"] = filter_str
+    #body["filter"] = filter_str
 
     headers = {
         'Content-Type': 'application/json',
