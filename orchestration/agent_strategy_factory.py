@@ -2,6 +2,7 @@
 from .strategies.classic_rag_agent_strategy import ClassicRAGAgentStrategy
 from .strategies.multimodal_agent_strategy import MultimodalAgentStrategy
 from .strategies.fine_tuned_slm_strategy import FineTunedSLMStrategy
+from .strategies.fine_tuned_slm_multimodal_strategy import FineTunedSLMMultimodalStrategy
 # NL2SQL Strategies
 from .strategies.nl2sql_standard_strategy import NL2SQLStandardStrategy
 from .strategies.nl2sql_fewshot_strategy import NL2SQLFewshotStrategy
@@ -19,6 +20,8 @@ class AgentStrategyFactory:
             return MultimodalAgentStrategy()        
         elif strategy_type == Strategy.FINE_TUNED_SLM:
             return FineTunedSLMStrategy()
+        elif strategy_type == Strategy.FINE_TUNED_SLM_MULTIMODAL:
+            return FineTunedSLMMultimodalStrategy()
         elif strategy_type == Strategy.CHAT_WITH_FABRIC:
             return ChatWithFabricStrategy()    
         elif strategy_type == Strategy.NL2SQL:

@@ -8,6 +8,7 @@ class Strategy(Enum):
     NL2SQL_FEWSHOT = 'nl2sql_fewshot'
     CHAT_WITH_FABRIC = 'chat_with_fabric'
     FINE_TUNED_SLM = 'fine_tuned_slm'
+    FINE_TUNED_SLM_MULTIMODAL = 'fine_tuned_slm_multimodal'
 
 # orchestrator output types
 class OutputFormat(Enum):
