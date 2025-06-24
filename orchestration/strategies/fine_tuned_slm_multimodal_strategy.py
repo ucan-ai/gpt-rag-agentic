@@ -115,7 +115,7 @@ class FinalMultimodalResponseAgent(BaseChatAgent):
             description="An agent that combines text response with images for final multimodal output."
         )
         self._model_context = model_context
-        self.system_prompt = system_prompt + "\n\n"
+        self.system_prompt = system_prompt
 
     @property
     def produced_message_types(self):
@@ -159,7 +159,7 @@ class FinalMultimodalResponseAgent(BaseChatAgent):
             return Response(chat_message=fallback_msg)
 
         # Use synthesis response as the main content (following original multimodal pattern)
-        combined_text = self.system_prompt + synthesis_response if synthesis_response else "No synthesis response"
+        combined_text = self.system_prompt + "\n\n" + synthesis_response if synthesis_response else self.system_prompt + "\n\nNo synthesis response"
         logging.debug(f"[fine_tuned_slm_multimodal_strategy] combined_text: {combined_text}")
 
         # Download and process images if available
@@ -170,6 +170,8 @@ class FinalMultimodalResponseAgent(BaseChatAgent):
             
             max_images = 50  # maximum number of images to process
             document_count = 0
+            successful_downloads = 0
+            failed_downloads = 0
             
             for image_urls_list_item in image_urls_list:
                 image_count = 0
@@ -198,10 +200,14 @@ class FinalMultimodalResponseAgent(BaseChatAgent):
                         # Append the PIL Image object to your list
                         image_objects.append(pil_img)
                         image_count += 1
+                        successful_downloads += 1
                         logging.info(f"[fine_tuned_slm_multimodal_strategy] Successfully loaded image from {url}")
 
                     except Exception as e:
-                        logging.error(f"[fine_tuned_slm_multimodal_strategy] Could not load image from {url}: {e}")
+                        failed_downloads += 1
+                        logging.warning(f"[fine_tuned_slm_multimodal_strategy] Could not load image from {url}: {e}")
+                        # Continue processing other images instead of failing completely
+                        continue
                     
                     if len(image_objects) >= max_images:
                         break
@@ -209,6 +215,12 @@ class FinalMultimodalResponseAgent(BaseChatAgent):
                 document_count += 1
                 if len(image_objects) >= max_images:
                     break
+            
+            logging.info(f"[fine_tuned_slm_multimodal_strategy] Image processing completed. Successfully downloaded: {successful_downloads}, Failed: {failed_downloads}")
+            
+            # Add a note to the response if some images couldn't be loaded
+            if failed_downloads > 0:
+                combined_text += f"\n\n*Note: {failed_downloads} images could not be loaded due to missing files.*"
 
         # Construct and return the MultiModalMessage response (like original multimodal strategy)
         multimodal_msg = MultiModalMessage(
@@ -243,16 +255,26 @@ class FineTunedSLMMultimodalStrategy(BaseAgentStrategy):
         
     def _get_slm_model_client(self):
         """Get model client for the fine-tuned SLM using Azure AI Inference endpoint"""
-        from autogen_ext.models.openai import OpenAIChatCompletionClient
-        
-        # Use OpenAI client with custom endpoint and API key for Azure AI Inference
-        return OpenAIChatCompletionClient(
-            model="gpt-4o-mini",  # Use a known model name to avoid model_info lookup issues
-            api_key=self.slm_api_key,
-            base_url=self.slm_endpoint,  # Use endpoint as-is (Azure AI Inference format)
-            temperature=self.slm_temperature,
-            max_tokens=self.slm_max_tokens
-        )
+        try:
+            from autogen_ext.models.openai import OpenAIChatCompletionClient
+            
+            # Use OpenAI client with custom endpoint and API key for Azure AI Inference
+            client = OpenAIChatCompletionClient(
+                model="gpt-4o-mini",  # Use a known model name to avoid model_info lookup issues
+                api_key=self.slm_api_key,
+                base_url=self.slm_endpoint,  # Use endpoint as-is (Azure AI Inference format)
+                temperature=self.slm_temperature,
+                max_tokens=self.slm_max_tokens
+            )
+            
+            logging.info(f"[fine_tuned_slm_multimodal_strategy] Successfully initialized fine-tuned SLM client with endpoint: {self.slm_endpoint}")
+            return client
+            
+        except Exception as e:
+            logging.error(f"[fine_tuned_slm_multimodal_strategy] Failed to initialize fine-tuned SLM client: {e}")
+            logging.warning(f"[fine_tuned_slm_multimodal_strategy] Falling back to regular model client")
+            # Fallback to regular model client if fine-tuned SLM fails
+            return self._get_model_client()
 
     async def create_agents(self, history, client_principal=None, access_token=None, output_mode=None, output_format=None):
         """
@@ -269,115 +291,124 @@ class FineTunedSLMMultimodalStrategy(BaseAgentStrategy):
         - agent_configuration: A dictionary that includes the agents team, default model client, termination conditions and selector function.
         """
 
-        # Model Context
-        shared_context = await self._get_model_context(history) 
+        try:
+            # Model Context
+            shared_context = await self._get_model_context(history) 
 
-        # Wrapper Functions for Tools
+            # Wrapper Functions for Tools
 
-        async def vector_index_retrieve_wrapper(
-            input: Annotated[str, "An optimized query string based on the user's ask and conversation history, when available"]
-        ) -> MultimodalVectorIndexRetrievalResult:
-            return await multimodal_vector_index_retrieve(input, self._generate_security_ids(client_principal))
+            async def vector_index_retrieve_wrapper(
+                input: Annotated[str, "An optimized query string based on the user's ask and conversation history, when available"]
+            ) -> MultimodalVectorIndexRetrievalResult:
+                return await multimodal_vector_index_retrieve(input, self._generate_security_ids(client_principal))
 
-        vector_index_retrieve_tool = FunctionTool(
-            vector_index_retrieve_wrapper, 
-            name="vector_index_retrieve", 
-            description="Performs a vector search using Azure AI Search fetching text and related images to get relevant sources for answering the user's query."
-        )
+            vector_index_retrieve_tool = FunctionTool(
+                vector_index_retrieve_wrapper, 
+                name="vector_index_retrieve", 
+                description="Performs a vector search using Azure AI Search fetching text and related images to get relevant sources for answering the user's query."
+            )
 
-        # Agents
+            # Agents
 
-        ## Query Formulation Agent (Fine-tuned SLM - Step 1)
-        query_formulation_prompt = await self._read_prompt("query_formulation_agent")
-        query_formulation_agent = AssistantAgent(
-            name="query_formulation_agent",
-            system_message=query_formulation_prompt,
-            model_client=self._get_slm_model_client(),  # Use fine-tuned SLM
-            tools=[],  # No tools needed for query formulation
-            reflect_on_tool_use=False,
-            model_context=shared_context
-        )
+            ## Query Formulation Agent (Fine-tuned SLM - Step 1)
+            query_formulation_prompt = await self._read_prompt("query_formulation_agent")
+            query_formulation_agent = AssistantAgent(
+                name="query_formulation_agent",
+                system_message=query_formulation_prompt,
+                model_client=self._get_slm_model_client(),  # Use fine-tuned SLM
+                tools=[],  # No tools needed for query formulation
+                reflect_on_tool_use=False,
+                model_context=shared_context
+            )
 
-        ## RAG Retrieval Agent  
-        rag_retrieval_prompt = await self._read_prompt("rag_retrieval_agent")
-        rag_retrieval_agent = AssistantAgent(
-            name="rag_retrieval_agent",
-            system_message=rag_retrieval_prompt,
-            model_client=self._get_model_client(),  # Use regular model
-            tools=[vector_index_retrieve_tool],
-            reflect_on_tool_use=False,
-            model_context=shared_context
-        )
+            ## RAG Retrieval Agent  
+            rag_retrieval_prompt = await self._read_prompt("rag_retrieval_agent")
+            rag_retrieval_agent = AssistantAgent(
+                name="rag_retrieval_agent",
+                system_message=rag_retrieval_prompt,
+                model_client=self._get_model_client(),  # Use regular model
+                tools=[vector_index_retrieve_tool],
+                reflect_on_tool_use=False,
+                model_context=shared_context
+            )
 
-        ## Multimodal Context Formatter Agent
-        multimodal_context_formatter = MultimodalContextFormatterAgent(
-            name="multimodal_context_formatter", 
-            model_context=shared_context
-        )
+            ## Multimodal Context Formatter Agent
+            multimodal_context_formatter = MultimodalContextFormatterAgent(
+                name="multimodal_context_formatter", 
+                model_context=shared_context
+            )
 
-        ## Synthesis Agent (Fine-tuned SLM - Step 2) - Text only
-        synthesis_prompt = await self._read_prompt("synthesis_agent")
-        synthesis_agent = AssistantAgent(
-            name="synthesis_agent",
-            system_message=synthesis_prompt,
-            model_client=self._get_slm_model_client(),  # Use fine-tuned SLM
-            tools=[],  # No tools needed for synthesis
-            reflect_on_tool_use=True,
-            model_context=shared_context
-        )
+            ## Synthesis Agent (Fine-tuned SLM - Step 2) - Text only
+            synthesis_prompt = await self._read_prompt("synthesis_agent")
+            synthesis_agent = AssistantAgent(
+                name="synthesis_agent",
+                system_message=synthesis_prompt,
+                model_client=self._get_slm_model_client(),  # Use fine-tuned SLM
+                tools=[],  # No tools needed for synthesis
+                reflect_on_tool_use=True,
+                model_context=shared_context
+            )
 
-        ## Final Multimodal Response Agent - Combines text response with images for display
-        multimodal_rag_message_prompt = await self._read_prompt("multimodal_rag_message")
-        final_multimodal_response = FinalMultimodalResponseAgent(
-            name="final_multimodal_response", 
-            system_prompt=multimodal_rag_message_prompt,
-            model_context=shared_context
-        )
+            ## Final Multimodal Response Agent - Combines text response with images for display
+            multimodal_rag_message_prompt = await self._read_prompt("multimodal_rag_message")
+            final_multimodal_response = FinalMultimodalResponseAgent(
+                name="final_multimodal_response", 
+                system_prompt=multimodal_rag_message_prompt,
+                model_context=shared_context
+            )
 
-        ## Chat Closure Agent
-        chat_closure = await self._create_chat_closure_agent(output_format, output_mode)
+            ## Chat Closure Agent
+            chat_closure = await self._create_chat_closure_agent(output_format, output_mode)
 
-        # Agent Configuration
+            # Agent Configuration
 
-        def custom_selector_func(messages):
-            """
-            Selects the next agent based on the source of the last message.
+            def custom_selector_func(messages):
+                """
+                Selects the next agent based on the source of the last message.
+                
+                Transition Rules:
+                    user -> query_formulation_agent (Step 1 - Query Formulation)
+                    query_formulation_agent -> rag_retrieval_agent (Step 2 - RAG Retrieval)
+                    rag_retrieval_agent (ToolCallSummaryMessage) -> multimodal_context_formatter (Step 3 - Text Context Formatting)
+                    multimodal_context_formatter -> synthesis_agent (Step 4 - Text Synthesis)
+                    synthesis_agent -> final_multimodal_response (Step 5 - Combine text with images)
+                    final_multimodal_response -> chat_closure (Final output)
+                """            
+                last_msg = messages[-1]
+                logging.info(f"[fine_tuned_slm_multimodal_strategy] Selector received {len(messages)} messages")
+                logging.info(f"[fine_tuned_slm_multimodal_strategy] Last message source: {last_msg.source}, type: {type(last_msg).__name__}")
+                logging.debug(f"[fine_tuned_slm_multimodal_strategy] last message: {last_msg}")
+
+                agent_selection = {
+                    "user": "query_formulation_agent",
+                    "query_formulation_agent": "rag_retrieval_agent",
+                    "rag_retrieval_agent": "multimodal_context_formatter" if isinstance(last_msg, ToolCallSummaryMessage) else None,
+                    "multimodal_context_formatter": "synthesis_agent",
+                    "synthesis_agent": "final_multimodal_response",
+                    "final_multimodal_response": "chat_closure",
+                }
+
+                selected_agent = agent_selection.get(last_msg.source)
+
+                # Fallback for rag_retrieval_agent without tool call
+                if selected_agent is None and last_msg.source == "rag_retrieval_agent":
+                    selected_agent = "chat_closure"
+                    logging.info(f"[fine_tuned_slm_multimodal_strategy] Using fallback for rag_retrieval_agent -> chat_closure")
+
+                if selected_agent:
+                    logging.info(f"[fine_tuned_slm_multimodal_strategy] Selected agent: {selected_agent}")
+                    return selected_agent
+
+                logging.warning(f"[fine_tuned_slm_multimodal_strategy] No agent selected for message from: {last_msg.source}")
+                return None
             
-            Transition Rules:
-                user -> query_formulation_agent (Step 1 - Query Formulation)
-                query_formulation_agent -> rag_retrieval_agent (Step 2 - RAG Retrieval)
-                rag_retrieval_agent (ToolCallSummaryMessage) -> multimodal_context_formatter (Step 3 - Text Context Formatting)
-                multimodal_context_formatter -> synthesis_agent (Step 4 - Text Synthesis)
-                synthesis_agent -> final_multimodal_response (Step 5 - Combine text with images)
-                final_multimodal_response -> chat_closure (Final output)
-            """            
-            last_msg = messages[-1]
-            logging.debug(f"[fine_tuned_slm_multimodal_strategy] last message: {last_msg}")
+            self.selector_func = custom_selector_func
 
-            agent_selection = {
-                "user": "query_formulation_agent",
-                "query_formulation_agent": "rag_retrieval_agent",
-                "rag_retrieval_agent": "multimodal_context_formatter" if isinstance(last_msg, ToolCallSummaryMessage) else None,
-                "multimodal_context_formatter": "synthesis_agent",
-                "synthesis_agent": "final_multimodal_response",
-                "final_multimodal_response": "chat_closure",
-            }
-
-            selected_agent = agent_selection.get(last_msg.source)
-
-            # Fallback for rag_retrieval_agent without tool call
-            if selected_agent is None and last_msg.source == "rag_retrieval_agent":
-                selected_agent = "chat_closure"
-
-            if selected_agent:
-                logging.debug(f"[fine_tuned_slm_multimodal_strategy] selected {selected_agent} agent")
-                return selected_agent
-
-            logging.debug("[fine_tuned_slm_multimodal_strategy] selected None")
-            return None
-        
-        self.selector_func = custom_selector_func
-
-        self.agents = [query_formulation_agent, rag_retrieval_agent, multimodal_context_formatter, synthesis_agent, final_multimodal_response, chat_closure]
-        
-        return self._get_agents_configuration() 
+            self.agents = [query_formulation_agent, rag_retrieval_agent, multimodal_context_formatter, synthesis_agent, final_multimodal_response, chat_closure]
+            
+            logging.info(f"[fine_tuned_slm_multimodal_strategy] Successfully created all agents")
+            return self._get_agents_configuration()
+            
+        except Exception as e:
+            logging.error(f"[fine_tuned_slm_multimodal_strategy] Error creating agents: {e}", exc_info=True)
+            raise RuntimeError(f"Failed to create fine-tuned SLM multimodal agents: {e}") from e 
